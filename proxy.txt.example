@@ -1,0 +1,12 @@
+# Optional outbound proxy for merchant-facing traffic (browser + redirect resolution).
+# To enable: copy this file to  proxy.txt  and put ONE proxy URL on the first line.
+# A UK residential proxy is what clears the IP/geo-scored 403/429 WARNs (Expedia, Oakley,
+# Argos, etc.) that no browser fingerprint can beat. Datacenter proxies rarely help.
+#
+# Format:  scheme://[user:pass@]host:port
+#   http://user:pass@gw.provider.com:7000
+#   socks5://user:pass@residential.provider.com:1080
+#
+# The Capillary Bifrost API call is always sent DIRECT (never through this proxy).
+# Precedence: env QC_PROXY  >  proxy.txt  >  PROXY constant in url_qc.py.
+# Run `python url_qc.py --no-proxy` to ignore a configured proxy for one run.

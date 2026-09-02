@@ -1,0 +1,19 @@
+# ── Secrets / credentials (never commit) ──────────────────────────────
+oauth_credentials.json
+token.pkl
+bifrost_token.txt
+proxy.txt
+
+# ── Local browser profile (cookies / session) ─────────────────────────
+.chrome_profile/
+
+# ── Generated output ──────────────────────────────────────────────────
+screenshots/
+reports/
+logs/
+*.log
+logs_*.txt
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
