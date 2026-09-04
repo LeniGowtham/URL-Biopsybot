@@ -29,6 +29,74 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 import gspread
 from playwright.async_api import async_playwright
 
+# ── Console styling (interactive terminals only) ─────────────────────────────────
+# When stdout is a real terminal (CMD / PowerShell / Windows Terminal) we render a colored,
+# per-link progress design with a mini progress bar. When output is redirected — e.g. the
+# scheduled run's logs\run.log (isatty() is False) — we emit the plain ASCII log format so
+# the log stays clean and grep-able. Nothing here changes what gets recorded to CSV/Sheet.
+IS_TTY = sys.stdout.isatty()
+if IS_TTY:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")      # allow the box-drawing / check glyphs
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:                                           # enable ANSI on legacy Windows consoles
+            import ctypes
+            _k = ctypes.windll.kernel32
+            _k.SetConsoleMode(_k.GetStdHandle(-11), 7) # ENABLE_PROCESSED|WRAP|VIRTUAL_TERMINAL
+        except Exception:
+            pass
+
+def _sgr(code):
+    return code if IS_TTY else ""
+
+C_RESET = _sgr("\033[0m");  C_BOLD   = _sgr("\033[1m");  C_DIM    = _sgr("\033[2m")
+C_GREEN = _sgr("\033[32m"); C_YELLOW = _sgr("\033[33m"); C_RED    = _sgr("\033[31m")
+C_GREY  = _sgr("\033[90m"); C_CYAN   = _sgr("\033[36m")
+
+def _enc_ok(s):
+    try:
+        s.encode(sys.stdout.encoding or "ascii"); return True
+    except Exception:
+        return False
+
+_FANCY   = IS_TTY and _enc_ok("█░✓✗")
+_BAR_ON  = "█" if _FANCY else "#"
+_BAR_OFF = "░" if _FANCY else "-"
+# per-result colour + glyph
+_RESULT_STYLE = {
+    "PASS":     (C_GREEN,  "✓" if _FANCY else "OK"),
+    "WARN":     (C_YELLOW, "▲" if _FANCY else "! "),
+    "FAIL":     (C_RED,    "✗" if _FANCY else "X "),
+    "TEMPLATE": (C_GREY,   "·" if _FANCY else ".."),
+}
+_progress = {"done": 0}
+
+def print_link_progress(total, result, brand, sku, detail):
+    """Print one line as each link finishes. Interactive terminals get a colored mini
+    progress bar + status badge; redirected output gets the plain log format."""
+    _progress["done"] += 1
+    done   = _progress["done"]
+    colour, glyph = _RESULT_STYLE.get(result, (C_RESET, "??"))
+    brand  = (brand or "")[:9]
+    sku    = (sku or "")[:22]
+    plain = (f"  [{done}/{total}] "
+             f"{ {'PASS':'OK ','WARN':'.. ','FAIL':'XX ','TEMPLATE':'-- '}.get(result, '?? ') }"
+             f"{brand:<9} {sku:<22} {result} ({detail})")
+    if not IS_TTY:
+        print(plain); return
+    pct  = (done / total) if total else 1.0
+    w    = 16
+    fill = int(pct * w)
+    bar  = _BAR_ON * fill + _BAR_OFF * (w - fill)
+    head = f"{C_DIM}{bar}{C_RESET} {int(pct*100):3d}% {C_DIM}[{done:>3}/{total}]{C_RESET}"
+    badge = f"{colour}{C_BOLD}{glyph} {result:<8}{C_RESET}"
+    try:
+        print(f" {head}  {badge} {C_CYAN}{brand:<9}{C_RESET} {sku:<22} {C_DIM}{detail}{C_RESET}")
+    except UnicodeEncodeError:
+        print(plain)                                   # last-resort: never crash on a glyph
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 SPREADSHEET_ID = "1bkDvHQ1NdzvTjsBVsvAQRuJWWNw8tZjD7lVK7et7dc8"
 SCOPES         = ["https://www.googleapis.com/auth/spreadsheets",
@@ -677,7 +745,7 @@ async def qc_offer(context, recheck_context, recheck_engine, chrome_context,
         # 0) A BI/BIFROST offer whose activatedUrl couldn't be resolved has nothing to test.
         if offer.get("bifrost_error"):
             note = f"Bifrost: {offer['bifrost_error']}"
-            print(f"  [{i}/{total}] XX {offer['brand']:<9} {offer['sku'][:22]:<22} FAIL ({note})")
+            print_link_progress(total, "FAIL", offer["brand"], offer["sku"], note)
             return {**offer, "final_url": "", "http_status": "", "result": "FAIL",
                     "note": note, "screenshot": ""}
 
@@ -685,7 +753,7 @@ async def qc_offer(context, recheck_context, recheck_engine, chrome_context,
         eff_url, leftover = apply_subs(offer["url"])
         if leftover:
             note = f"unresolved placeholder {' '.join(sorted(set(leftover)))} - set it in SUBSTITUTIONS"
-            print(f"  [{i}/{total}] -- {offer['brand']:<9} {offer['sku'][:22]:<22} TEMPLATE ({note})")
+            print_link_progress(total, "TEMPLATE", offer["brand"], offer["sku"], note)
             return {**offer, "final_url": "", "http_status": "", "result": "TEMPLATE",
                     "note": note, "screenshot": ""}
 
@@ -728,9 +796,7 @@ async def qc_offer(context, recheck_context, recheck_engine, chrome_context,
             note = (f"{note} [reconfirmed via {' -> '.join(chain)}; "
                     f"Chromium first pass was HTTP {first_status}]")
 
-        mark = {"PASS": "OK ", "WARN": ".. ", "FAIL": "XX "}[result]
-        print(f"  [{i}/{total}] {mark}{offer['brand']:<9} {offer['sku'][:22]:<22} "
-              f"{result} ({note})")
+        print_link_progress(total, result, offer["brand"], offer["sku"], note)
         return {
             **offer,
             "final_url": final_url,
@@ -770,6 +836,7 @@ async def run_qc(offers, run_date, on_result, proxy=None):
     mid-run still keeps everything completed so far).
     `proxy` (a Playwright proxy dict or None) is applied to every browser engine."""
     shot_base = os.path.join(SCREENSHOT_ROOT, run_date)
+    _progress["done"] = 0                              # reset the styled progress counter
     sem_default = asyncio.Semaphore(CONCURRENCY)       # normal merchant/affiliate links
     sem_redeem  = asyncio.Semaphore(REDEEM_CONCURRENCY) # rate-limited Capillary redeem host
 
@@ -1296,9 +1363,12 @@ def main():
     from collections import Counter
     all_rows = load_rows(csv_path)
     by_result = Counter(r.get("result", "") for r in all_rows)
-    print(f"\n{'='*60}")
-    print(f"Recorded so far: {len(all_rows)}   PASS={by_result['PASS']}  "
-          f"WARN={by_result['WARN']}  FAIL={by_result['FAIL']}  TEMPLATE={by_result['TEMPLATE']}")
+    print(f"\n{C_DIM}{'='*60}{C_RESET}")
+    print(f"{C_BOLD}Recorded so far: {len(all_rows)}{C_RESET}   "
+          f"{C_GREEN}PASS={by_result['PASS']}{C_RESET}  "
+          f"{C_YELLOW}WARN={by_result['WARN']}{C_RESET}  "
+          f"{C_RED}FAIL={by_result['FAIL']}{C_RESET}  "
+          f"{C_GREY}TEMPLATE={by_result['TEMPLATE']}{C_RESET}")
     fails = Counter(r["brand"] for r in all_rows if r.get("result") == "FAIL")
     if fails:
         print("Failures by brand: " + ", ".join(f"{b}:{n}" for b, n in fails.items()))
