@@ -32,6 +32,10 @@
         <DaysInterval>1</DaysInterval>
       </ScheduleByDay>
     </CalendarTrigger>
+    <LogonTrigger>
+      <Delay>PT2M</Delay>
+      <UserId>CLPT2248\gowtham.km</UserId>
+    </LogonTrigger>
   </Triggers>
   <Actions Context="Author">
     <Exec>

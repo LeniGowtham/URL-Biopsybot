@@ -1,8 +1,12 @@
 # Daily schedule — URL QC
 
 The daily QC run is driven by the Windows Task Scheduler task **`URL QC Daily`**,
-which runs `run_daily.bat` (→ `python url_qc.py --no-bifrost-api --email`) every day
-at **07:00 IST**.
+which runs `run_daily.bat` (→ `python url_qc.py --no-bifrost-api --email`).
+
+**Triggers (two):**
+- **Daily at 07:00 IST.**
+- **At logon** (2-min delay) — so it also runs each time you turn the machine on and
+  sign in. `MultipleInstancesPolicy = IgnoreNew` stops the two triggers double-running.
 
 ## Files
 - `URL-QC-Daily.task.xml` — exported task definition (source of truth).
