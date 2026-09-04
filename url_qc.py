@@ -18,7 +18,7 @@ Usage:
   python url_qc.py --brand Frontier
   python url_qc.py --no-sheet      # local screenshots + CSV only
 """
-import os, sys, csv, time, argparse, asyncio, re, random, uuid
+import os, sys, csv, time, argparse, asyncio, re, random, uuid, shutil
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -31,11 +31,25 @@ from playwright.async_api import async_playwright
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 SPREADSHEET_ID = "1bkDvHQ1NdzvTjsBVsvAQRuJWWNw8tZjD7lVK7et7dc8"
-SCOPES         = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES         = ["https://www.googleapis.com/auth/spreadsheets",
+                  "https://www.googleapis.com/auth/gmail.send"]  # gmail.send: email the report
 SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 CREDS_PATH     = os.path.join(SCRIPT_DIR, "oauth_credentials.json")
 TOKEN_PATH     = os.path.join(SCRIPT_DIR, "token.pkl")
-SCREENSHOT_ROOT= os.path.join(SCRIPT_DIR, "screenshots")
+# Screenshots go to the content-ops team's shared drive so the whole team can view them.
+# Override with env QC_SCREENSHOT_ROOT. Falls back to a local folder if the shared drive
+# isn't mounted (e.g. an unattended run while G: is offline) so a run never fails over it.
+SHARED_SCREENSHOT_ROOT = r"G:\Shared drives\content-ops-team\URL QC"
+def _resolve_screenshot_root():
+    env = os.environ.get("QC_SCREENSHOT_ROOT", "").strip()
+    if env:
+        return env
+    if os.path.isdir(os.path.dirname(SHARED_SCREENSHOT_ROOT)):
+        return SHARED_SCREENSHOT_ROOT
+    print(f"WARNING: shared drive '{os.path.dirname(SHARED_SCREENSHOT_ROOT)}' not available "
+          f"- saving screenshots to a local folder instead.")
+    return os.path.join(SCRIPT_DIR, "screenshots")
+SCREENSHOT_ROOT= _resolve_screenshot_root()
 REPORT_DIR     = os.path.join(SCRIPT_DIR, "reports")
 CHROME_PROFILE = os.path.join(SCRIPT_DIR, ".chrome_profile")  # persistent real-Chrome profile (final tier)
 
@@ -51,7 +65,7 @@ BLANK_STD_THRESH = 3.0       # mean per-channel pixel std below this = near-unif
 BLANK_MAX_TRIES  = 3         # how many times to wait+retake before giving up
 BLANK_WAIT_MS    = 3000      # extra wait between content checks / blank re-takes
 CONTENT_MIN      = 30        # min "content score" (visible text length + media*50) to proceed
-VIEWPORT       = {"width": 1366, "height": 900}
+VIEWPORT       = {"width": 1920, "height": 1080}   # full desktop resolution (clears tablet/mobile breakpoints)
 # Coherent UA per engine — a Chrome UA on the Firefox engine is itself a bot tell, so the
 # reconfirm (Firefox) pass sends a real Firefox UA. This gives two *consistent*, different
 # fingerprints, which is what gets a bot-blocked (403) offer through on the second look.
@@ -142,15 +156,27 @@ def resolve_bifrost_activated_url(external_offer_id, token):
         return "", "no activatedUrl in Bifrost response"
     return url, ""
 
-def resolve_bifrost_offers(offers, worksheet=None):
+def _drop_bifrost(offers, todo):
+    """Remove the given BI/BIFROST offers from `offers` in place (by identity)."""
+    drop = {id(o) for o in todo}
+    offers[:] = [o for o in offers if id(o) not in drop]
+
+def resolve_bifrost_offers(offers, worksheet=None, optional=False):
     """For every BI/BIFROST offer, replace its url with the Bifrost activatedUrl.
     Offers that can't be resolved get a 'bifrost_error' note (reported FAIL later).
-    If `worksheet` is given, resolved urls are written back into its redemption_url column."""
+    If `worksheet` is given, resolved urls are written back into its redemption_url column.
+    If `optional` is True, a missing/expired token doesn't stop the run — the BI/BIFROST
+    offers are dropped (skipped) and the remaining direct-url offers are still QC'd."""
     todo = [o for o in offers if o.get("source", "").strip().upper() in BIFROST_SOURCES]
     if not todo:
         return
     token = get_bifrost_token()
     if not token:
+        if optional:
+            print(f"WARNING: no Bifrost token — skipping {len(todo)} BI/BIFROST offers, "
+                  f"QC'ing the direct-url offers only. Refresh {BIFROST_TOKEN_FILE} to include them.")
+            _drop_bifrost(offers, todo)
+            return
         sys.exit(f"ERROR: {len(todo)} BI/BIFROST offers need a token. "
                  f"Paste one into {BIFROST_TOKEN_FILE}.")
     print(f"Resolving activatedUrl for {len(todo)} BI/BIFROST offers via Bifrost API...")
@@ -158,6 +184,12 @@ def resolve_bifrost_offers(offers, worksheet=None):
     for i, o in enumerate(todo, 1):
         url, err = resolve_bifrost_activated_url(o.get("external_offer_id"), token)
         if err == "AUTH":
+            if optional:
+                print(f"WARNING: Bifrost token expired (HTTP 401/403) — skipping the remaining "
+                      f"BI/BIFROST offers, QC'ing the direct-url offers only. "
+                      f"Refresh {BIFROST_TOKEN_FILE} to include them.")
+                _drop_bifrost(offers, todo)
+                return
             sys.exit("ERROR: Bifrost token expired/invalid (HTTP 401/403). "
                      f"Refresh it in {BIFROST_TOKEN_FILE} and re-run.")
         if url:
@@ -225,8 +257,12 @@ def get_credentials():
     if os.path.exists(TOKEN_PATH):
         with open(TOKEN_PATH, "rb") as f:
             creds = pickle.load(f)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+    # Re-consent if the token is missing/invalid OR doesn't yet cover all SCOPES (e.g. after
+    # gmail.send was added — a token minted for Sheets only won't have it).
+    have = set(getattr(creds, "scopes", None) or []) if creds else set()
+    has_scopes = set(SCOPES).issubset(have)
+    if not creds or not creds.valid or not has_scopes:
+        if creds and creds.expired and creds.refresh_token and has_scopes:
             creds.refresh(Request())
         else:
             flow  = InstalledAppFlow.from_client_secrets_file(CREDS_PATH, SCOPES)
@@ -288,9 +324,9 @@ def load_worklist(spreadsheet):
             "_row":     ridx,          # sheet row, for writing resolved urls back
             "_rdm_col": rdm_col,       # redemption_url column (1-based)
         })
-    n_bi = sum(1 for o in offers if o["source"].strip().upper() in BIFROST_SOURCES)
-    print(f"Worklist tab: '{ws.title}'  ->  {len(offers)} offers "
-          f"({n_bi} BI/BIFROST resolved via API, {len(offers)-n_bi} with a direct redemption_url)")
+    n_url = sum(1 for o in offers if o.get("url", "").strip())
+    print(f"Worklist tab: '{ws.title}'  ->  {len(offers)} rows "
+          f"({n_url} with a redemption_url, {len(offers)-n_url} blank)")
     return offers, ws
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
@@ -298,21 +334,28 @@ def safe_name(s: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", s.strip())
     return s[:80] or "offer"
 
-def classify(status, final_url, error):
+def classify(status, final_url, error, soft_block=False, dead=False):
     """Return (result, note). result in {PASS, WARN, FAIL}.
-      FAIL  = broken: no response, junk landing host, or a hard 4xx/5xx.
+      FAIL  = broken: no response, junk landing host, a hard 4xx/5xx, or a page whose body
+              says the link is inactive/dead/expired (even on a 200).
       WARN  = reached the right place but guarded (bot-block / rate-limit) — eyeball the screenshot.
       PASS  = landed on a real page (2xx, or the merchant's own 3xx homepage redirect).
+    `soft_block` = OK status but a WAF "Access Denied"/bot-challenge body -> WARN.
+    `dead`       = OK status but the body reports the link is inactive/expired -> FAIL.
     """
     host = urlparse(final_url or "").netloc.lower()
     if error:
         return "FAIL", error
     if host in JUNK_HOSTS or final_url.startswith(("http://.com", "https://.com")):
         return "FAIL", f"junk landing host '{host or final_url}'"
+    if dead:
+        return "FAIL", "landing page reports the link is inactive/dead"
     if status is None:
         return "FAIL", "no HTTP response"
     if status in (401, 403, 418, 429):
         return "WARN", f"HTTP {status} (bot-block/rate-limit - check screenshot)"
+    if soft_block and status < 400:
+        return "WARN", f"HTTP {status} but access-denied/bot-block page (check screenshot)"
     if status >= 400:
         return "FAIL", f"HTTP {status}"
     return "PASS", f"HTTP {status}"
@@ -353,6 +396,13 @@ def apply_subs(url):
     leftover = re.findall(r"\{[^}]+\}", url)
     return url, leftover
 
+# Direct-URL QC: when False (the default), we do NOT pre-resolve the redirect chain over
+# HTTP/1.1 ("curl") before opening the page — the browser is pointed straight at the
+# sheet's redemption_url and follows any redirects itself. URL preparation (Bifrost
+# resolution, redirect following) is owned by a separate project that writes the final URL
+# into the sheet. Set True to restore the requests-level pre-resolution.
+FOLLOW_REDIRECTS = False
+
 def resolve_redirects(url, max_hops=12):
     """Follow server redirects over HTTP/1.1 (header-only, no body download) to the
     final landing URL. Returns (status, final_url, error).
@@ -388,6 +438,53 @@ CONTENT_JS = """() => {
   return text + media * 50;
 }"""
 
+# A page can answer HTTP 200 yet actually BE a WAF "Access Denied" / bot-challenge page
+# (Akamai, Cloudflare, Imperva/Incapsula, PerimeterX/HUMAN…). Read the rendered text and
+# match these markers so we escalate (reconfirm) instead of calling that soft block a PASS.
+BLOCK_TEXT_JS = """() => {
+  const t = ((document.title || '') + ' \\n ' +
+             (document.body ? document.body.innerText : '')).toLowerCase();
+  return t.slice(0, 5000);
+}"""
+BLOCK_MARKERS = (
+    "access denied",
+    "access to this page has been denied",
+    "you don't have permission to access",
+    "you do not have permission to access",
+    "attention required",                 # Cloudflare
+    "performing security verification",   # Cloudflare Turnstile / managed challenge
+    "verifies you are not a bot",         # Cloudflare challenge body
+    "verify you are not a bot",
+    "checking if the site connection is secure",
+    "challenges.cloudflare.com",
+    "incompatible browser extension or network configuration",  # Cloudflare challenge failure
+    "pardon our interruption",            # PerimeterX / HUMAN
+    "please verify you are a human",
+    "verify you are human",
+    "checking your browser before accessing",
+    "request unsuccessful. incapsula",    # Imperva / Incapsula
+    "unusual traffic from your",
+    "this request was blocked",
+    "ddos protection by",
+)
+def looks_blocked(text):
+    """True if the rendered page text reads like a WAF/bot Access-Denied page."""
+    t = (text or "").lower()
+    return any(m in t for m in BLOCK_MARKERS)
+
+# A page can answer HTTP 200 yet be a dead/expired affiliate offer whose body says the link
+# is inactive. That is a broken offer (FAIL), NOT a bot-block (WARN) — detect it separately.
+INACTIVE_MARKERS = (
+    "this link is inactive",
+    "this link is no longer active",
+    "this link has expired",
+    "link is no longer available",
+)
+def looks_inactive(text):
+    """True if the landing page reports the offer link is dead/inactive/expired."""
+    t = (text or "").lower()
+    return any(m in t for m in INACTIVE_MARKERS)
+
 def _is_blank_image(path):
     """True if the screenshot is essentially one flat colour (white/black/unrendered)."""
     try:
@@ -421,15 +518,13 @@ async def _capture_nonblank(page, shot_path):
             pass
         await page.wait_for_timeout(BLANK_WAIT_MS)
 
-    # 2) Take the shot; if the pixels come out blank, wait and re-take.
+    # 2) Take the shot (landing page / viewport only, not the full scrolled page);
+    #    if the pixels come out blank, wait and re-take.
     for _ in range(BLANK_MAX_TRIES):
         try:
-            await page.screenshot(path=shot_path, full_page=True)
+            await page.screenshot(path=shot_path)   # viewport-only = the landing page
         except Exception:
-            try:
-                await page.screenshot(path=shot_path)   # viewport fallback
-            except Exception:
-                return
+            return
         if not _is_blank_image(shot_path):
             return
         await page.wait_for_timeout(BLANK_WAIT_MS)
@@ -450,8 +545,8 @@ async def _humanize(page):
 
 async def _screenshot_page(context, url, shot_path, max_attempts=2):
     """Navigate to a (already-resolved) URL and screenshot it.
-    Returns (browser_status, browser_final_url, browser_error)."""
-    b_status, b_final, b_err = None, "", ""
+    Returns (browser_status, browser_final_url, browser_error, soft_block, dead)."""
+    b_status, b_final, b_err, b_block, b_dead = None, "", "", False, False
     for attempt in range(1, max_attempts + 1):
         page = await context.new_page()
         try:
@@ -466,8 +561,13 @@ async def _screenshot_page(context, url, shot_path, max_attempts=2):
             await _humanize(page)
             b_final, b_err = page.url, ""
             await _capture_nonblank(page, shot_path)
+            try:
+                page_text = await page.evaluate(BLOCK_TEXT_JS)
+            except Exception:
+                page_text = ""
+            b_block, b_dead = looks_blocked(page_text), looks_inactive(page_text)
             await page.close()
-            return b_status, b_final, b_err
+            return b_status, b_final, b_err, b_block, b_dead
         except Exception as e:
             b_err = f"{type(e).__name__}: {str(e).splitlines()[0][:140]}"
             b_final = page.url if page.url and page.url != "about:blank" else ""
@@ -479,7 +579,7 @@ async def _screenshot_page(context, url, shot_path, max_attempts=2):
             if attempt == max_attempts or not is_transient(b_status, b_err):
                 break
             await asyncio.sleep(2.5 * attempt)
-    return b_status, b_final, b_err
+    return b_status, b_final, b_err, b_block, b_dead
 
 # Injected before any page script runs: erase the obvious "I'm an automated browser"
 # tells that bot walls (Akamai / DataDome / Cloudflare) fingerprint. Covers the same
@@ -550,21 +650,26 @@ async def new_hardened_context(browser, user_agent):
 async def _probe(context, eff_url, shot_path, throttle):
     """One full check with a given browser context: resolve the redirect chain over
     HTTP/1.1 (throttling the redeem endpoint), then load + screenshot the final landing
-    page. Returns (status, final_url, error) — prefers the browser's signals, falls back
-    to the requests-level ones."""
+    page. Returns (status, final_url, error, soft_block, dead) — prefers the browser's
+    signals, falls back to the requests-level ones."""
     if throttle is not None and is_redeem(eff_url):
         await throttle()
-    r_status, landing, r_err = await asyncio.to_thread(resolve_redirects, eff_url)
+    if FOLLOW_REDIRECTS:
+        r_status, landing, r_err = await asyncio.to_thread(resolve_redirects, eff_url)
+    else:
+        # Direct QC: open the sheet's redemption_url as-is and let the browser handle any
+        # redirects. No requests-level ("curl") pre-resolution.
+        r_status, landing, r_err = None, None, ""
     target = landing or eff_url
 
-    b_status, b_final, b_err = await _screenshot_page(context, target, shot_path)
+    b_status, b_final, b_err, soft_block, dead = await _screenshot_page(context, target, shot_path)
 
     final_url = b_final or landing or ""
     status    = b_status if b_status is not None else r_status
     error     = ""
     if status is None:
         error = b_err or r_err or "no HTTP response"
-    return status, final_url, error
+    return status, final_url, error, soft_block, dead
 
 async def qc_offer(context, recheck_context, recheck_engine, chrome_context,
                    offer, shot_dir, sem, throttle, i, total):
@@ -587,22 +692,25 @@ async def qc_offer(context, recheck_context, recheck_engine, chrome_context,
         # 1) First pass in the primary browser (Chromium)
         fname = f"{safe_name(offer['sku'] or offer['merchant'] or str(i))}.png"
         shot_path = os.path.join(shot_dir, fname)
-        status, final_url, error = await _probe(context, eff_url, shot_path, throttle)
-        result, note = classify(status, final_url, error)
+        status, final_url, error, soft_block, dead = await _probe(context, eff_url, shot_path, throttle)
+        result, note = classify(status, final_url, error, soft_block, dead)
         reconfirmed = ""
 
-        # 2) Anything that isn't a clean HTTP 200 is treated as possibly flaky/bot-blocked.
+        # 2) Anything that isn't a clean HTTP 200 — OR a 200 whose body is a WAF
+        #    "Access Denied"/bot page (soft_block) — is treated as possibly flaky/bot-blocked.
         #    Escalate through stronger fingerprints, pausing 5-10s before each, and STOP the
-        #    moment one returns 200. Each pass overwrites the screenshot and becomes the result.
+        #    moment one returns a clean 200. Each pass overwrites the screenshot and becomes
+        #    the result (so the retained screenshot is always the latest reconfirm).
         #      tier 1: a DIFFERENT engine (Firefox/WebKit) — coherent, alternative fingerprint
         #      tier 2: the REAL installed Chrome (channel=chrome) — strongest, most human
         escalations = [(recheck_context, recheck_engine), (chrome_context, "Chrome(real)")]
         first_status, chain = None, []
         for stage_ctx, stage_name in escalations:
-            if stage_ctx is None or status == 200:
+            if stage_ctx is None or (status == 200 and not soft_block):
                 break
             if first_status is None:
-                first_status = status if status is not None else "no-response"
+                first_status = ("200-blocked" if (status == 200 and soft_block)
+                                else (status if status is not None else "no-response"))
             chain.append(stage_name)
             # 429 rate-limits need a real cooldown to clear the limit window; other
             # bot-blocks (403/418/503) get a medium wait; plain non-200s a short settle.
@@ -613,8 +721,8 @@ async def qc_offer(context, recheck_context, recheck_engine, chrome_context,
             else:
                 wait = random.uniform(5, 10)
             await asyncio.sleep(wait)
-            status, final_url, error = await _probe(stage_ctx, eff_url, shot_path, throttle)
-            result, note = classify(status, final_url, error)
+            status, final_url, error, soft_block, dead = await _probe(stage_ctx, eff_url, shot_path, throttle)
+            result, note = classify(status, final_url, error, soft_block, dead)
         if chain:
             reconfirmed = f"{chain[-1]} (was {first_status})"
             note = (f"{note} [reconfirmed via {' -> '.join(chain)}; "
@@ -632,6 +740,30 @@ async def qc_offer(context, recheck_context, recheck_engine, chrome_context,
             "note": note,
             "screenshot": shot_path if os.path.exists(shot_path) else "",
         }
+
+def file_warn_screenshot(r, shot_base):
+    """A WARN offer's screenshot is MOVED out of its per-brand folder into a single
+    consolidated <date>/WARN/ folder, so the guarded pages live in one place and don't
+    clutter the brand folders. The offer's recorded screenshot path is updated to the new
+    WARN location (so the CSV/Sheet point at the moved file). Self-correcting: an offer that
+    is no longer WARN (e.g. after a targeted re-QC) has its stale WARN copy removed."""
+    warn_dir = os.path.join(shot_base, "WARN")
+    name = f"{safe_name(r.get('brand', ''))}_{safe_name(r.get('sku') or r.get('merchant') or '')}.png"
+    dest = os.path.join(warn_dir, name)
+    try:
+        if r.get("result") == "WARN":
+            src = r.get("screenshot") or ""
+            if src and os.path.exists(src):
+                os.makedirs(warn_dir, exist_ok=True)
+                if os.path.abspath(src) != os.path.abspath(dest):
+                    if os.path.exists(dest):
+                        os.remove(dest)          # overwrite any previous WARN image
+                    shutil.move(src, dest)       # move: don't leave it in the brand folder
+                r["screenshot"] = dest           # point CSV/Sheet at the moved file
+        elif os.path.exists(dest):
+            os.remove(dest)                      # dropped out of WARN — remove stale copy
+    except Exception as e:
+        print(f"  (couldn't file WARN screenshot for {r.get('sku')}: {e})")
 
 async def run_qc(offers, run_date, on_result, proxy=None):
     """Check every offer; call on_result(dict) as each finishes (streaming, so a kill
@@ -721,6 +853,7 @@ async def run_qc(offers, run_date, on_result, proxy=None):
                                   o, shot_dir, sem, throttle, i, total))
         for coro in asyncio.as_completed(tasks):
             r = await coro
+            file_warn_screenshot(r, shot_base)   # copy WARN shots into <date>/WARN/
             on_result(r)
             results.append(r)
         await context.close()
@@ -761,6 +894,26 @@ def load_rows(path):
         return []
     with open(path, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
+
+def upsert_csv(path, results, checked_at):
+    """Replace the (brand, sku) rows in today's CSV with these fresh results, keeping every
+    other row untouched. Used by a targeted --sku re-QC so re-checking a few offers doesn't
+    wipe the rest of the day's report. Appends any offer not already present."""
+    rows = load_rows(path)
+    idx = {(r.get("brand", ""), r.get("sku", "")): i for i, r in enumerate(rows)}
+    for res in results:
+        row = dict(zip(COLS, result_to_row(res, checked_at)))
+        key = (res["brand"], res["sku"])
+        if key in idx:
+            rows[idx[key]] = row
+        else:
+            idx[key] = len(rows)
+            rows.append(row)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(COLS)
+        for r in rows:
+            w.writerow([r.get(c, "") for c in COLS])
 
 RESULT_COLORS = {
     "PASS":     {"red": 0.80, "green": 0.92, "blue": 0.80},
@@ -818,20 +971,228 @@ def write_sheet_tab(spreadsheet, run_date):
         print(f"  (sheet formatting skipped: {e})")
     return title
 
+# ── Email the problem rows (TEMPLATE / WARN / FAIL) ──────────────────────────────
+# After a run, email the offers that need eyeballing (brand, merchant, redemption_url,
+# result) to the team. SMTP settings come from email_config.json next to this script
+# (preferred) or QC_SMTP_* env vars; the file is gitignored (it holds a password).
+#   email_config.json: {"host":"smtp.gmail.com","port":587,"user":"you@capillarytech.com",
+#                        "password":"<app-password>","sender":"you@capillarytech.com",
+#                        "to":"kampalapur.gowtham@capillarytech.com","use_tls":true}
+EMAIL_TO_DEFAULT  = "kampalapur.gowtham@capillarytech.com"
+EMAIL_CONFIG_FILE = os.path.join(SCRIPT_DIR, "email_config.json")
+EMAIL_RESULTS     = ("FAIL", "TEMPLATE", "WARN")   # problems only
+# Link to the live results tab (RESULTS_TAB "URL QC", gid 1254505539), shown in the email.
+RESULTS_SHEET_URL = ("https://docs.google.com/spreadsheets/d/"
+                     f"{SPREADSHEET_ID}/edit?gid=1254505539#gid=1254505539")
+
+def load_email_config():
+    """Email config from email_config.json (preferred) or env vars. Returns a dict, or None
+    if emailing isn't configured. Two delivery methods:
+      method="gmail_api" — send via the Gmail API using the SAME Google OAuth login used for
+                           Sheets (no password / app-password needed). Only needs to/sender.
+      method="smtp"      — classic SMTP (host/port/user/password), e.g. Gmail App Password."""
+    cfg = {}
+    if os.path.exists(EMAIL_CONFIG_FILE):
+        import json
+        try:
+            with open(EMAIL_CONFIG_FILE, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            print(f"  (email_config.json unreadable: {e})")
+    env = os.environ
+    method = (cfg.get("method") or env.get("QC_EMAIL_METHOD") or "").strip().lower()
+    host = (cfg.get("host") or env.get("QC_SMTP_HOST", "")).strip()
+    if not method:
+        method = "smtp" if host else None
+    if method is None:
+        return None                              # nothing configured -> skip emailing
+    user = (cfg.get("user") or env.get("QC_SMTP_USER", "")).strip()
+    to = (cfg.get("to") or env.get("QC_EMAIL_TO") or EMAIL_TO_DEFAULT).strip()
+    cc = (cfg.get("cc") or env.get("QC_EMAIL_CC") or "").strip()
+    return {
+        "method": method,
+        "host": host,
+        "port": int(cfg.get("port") or env.get("QC_SMTP_PORT") or 587),
+        "user": user,
+        "password": cfg.get("password") or env.get("QC_SMTP_PASSWORD", ""),
+        "sender": (cfg.get("sender") or cfg.get("from") or user or to).strip(),
+        "to": to,
+        "cc": cc,
+        "use_tls": bool(cfg.get("use_tls", True)),
+    }
+
+def build_report_rows(run_date):
+    """The TEMPLATE/WARN/FAIL rows from today's CSV, problems-first then by brand/merchant."""
+    order = {"FAIL": 0, "TEMPLATE": 1, "WARN": 2}
+    sub = [r for r in load_rows(csv_path_for(run_date)) if r.get("result") in EMAIL_RESULTS]
+    sub.sort(key=lambda r: (order.get(r.get("result", ""), 9),
+                            r.get("brand", ""), r.get("merchant", "")))
+    return sub
+
+def _email_bodies(run_date, sub):
+    """Return (subject, plain_text, html) for the report email."""
+    from collections import Counter
+    import html as _html
+    c = Counter(r.get("result", "") for r in sub)
+    subject = (f"URL QC {run_date}: {c.get('FAIL',0)} FAIL, "
+               f"{c.get('TEMPLATE',0)} TEMPLATE, {c.get('WARN',0)} WARN")
+    cols = ("brand", "merchant", "redemption_url", "result")
+    # plain text (tab-separated)
+    plain = [subject, "",
+             f"Kindly review URL Status here - {RESULTS_SHEET_URL}",
+             f"Review Images once here - {SHARED_SCREENSHOT_ROOT}", "",
+             "\t".join(cols)]
+    for r in sub:
+        plain.append("\t".join(str(r.get(k, "")) for k in cols))
+    if not sub:
+        plain.append("(nothing to report — no TEMPLATE/WARN/FAIL results)")
+    # html table
+    color = {"FAIL": "#f5cccc", "TEMPLATE": "#dedee6", "WARN": "#fff2b3"}
+    th = ("<th style='text-align:left;padding:6px 10px;border:1px solid #ccc;"
+          "background:#f0f0f0'>{}</th>")
+    head = "".join(th.format(h) for h in ("Brand", "Merchant", "Redemption URL", "Result"))
+    trs = []
+    for r in sub:
+        bg = color.get(r.get("result", ""), "#ffffff")
+        cells = []
+        for k in cols:
+            v = _html.escape(str(r.get(k, "")))
+            if k == "redemption_url":
+                v = f"<a href='{v}'>{v}</a>"
+            style = f"padding:6px 10px;border:1px solid #ccc;background:{bg}"
+            cells.append(f"<td style='{style}'>{v}</td>")
+        trs.append("<tr>" + "".join(cells) + "</tr>")
+    body_rows = "".join(trs) or ("<tr><td colspan='4' style='padding:10px'>"
+                                 "Nothing to report — no TEMPLATE/WARN/FAIL results.</td></tr>")
+    html_doc = (
+        f"<div style='font-family:Segoe UI,Arial,sans-serif;font-size:14px'>"
+        f"<p><b>{_html.escape(subject)}</b></p>"
+        f"<p>Kindly review URL Status here - "
+        f"<a href='{RESULTS_SHEET_URL}'>{RESULTS_SHEET_URL}</a><br>"
+        f"Review Images once here - <code>{_html.escape(SHARED_SCREENSHOT_ROOT)}</code></p>"
+        f"<p>Offers needing review from the {run_date} URL QC run "
+        f"(WARN screenshots are in the run's <code>WARN\\</code> folder).</p>"
+        f"<table style='border-collapse:collapse;font-size:13px'>"
+        f"<tr>{head}</tr>{body_rows}</table></div>")
+    return subject, "\n".join(plain), html_doc
+
+def _build_report_message(run_date, cfg, attach_csv=True):
+    """Build the MIME email for run_date's report. Returns (msg, recipients, n_rows)."""
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.application import MIMEApplication
+    sub = build_report_rows(run_date)
+    subject, plain, html_doc = _email_bodies(run_date, sub)
+    to_list = [a.strip() for a in cfg["to"].replace(";", ",").split(",") if a.strip()]
+    cc_list = [a.strip() for a in cfg.get("cc", "").replace(";", ",").split(",") if a.strip()]
+    recipients = to_list + cc_list               # everyone the message is actually delivered to
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = subject
+    msg["From"] = cfg["sender"] or cfg["user"] or cfg["to"]
+    msg["To"] = ", ".join(to_list)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(plain, "plain", "utf-8"))
+    alt.attach(MIMEText(html_doc, "html", "utf-8"))
+    msg.attach(alt)
+    if attach_csv and sub:
+        cols = ("brand", "merchant", "redemption_url", "result")
+        import io
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(cols)
+        for r in sub:
+            w.writerow([r.get(k, "") for k in cols])
+        att = MIMEApplication(buf.getvalue().encode("utf-8"), _subtype="csv")
+        att.add_header("Content-Disposition", "attachment",
+                       filename=f"url_qc_{run_date}_review.csv")
+        msg.attach(att)
+    return msg, recipients, len(sub)
+
+def _send_via_smtp(msg, recipients, cfg):
+    import smtplib
+    srv = smtplib.SMTP(cfg["host"], cfg["port"], timeout=30)
+    try:
+        srv.ehlo()
+        if cfg["use_tls"]:
+            srv.starttls()
+            srv.ehlo()
+        if cfg["user"] and cfg["password"]:
+            srv.login(cfg["user"], cfg["password"])
+        srv.sendmail(msg["From"], recipients, msg.as_string())
+    finally:
+        srv.quit()
+
+def _send_via_gmail_api(msg):
+    """Send with the Gmail API using the same Google OAuth login used for Sheets.
+    Requires the gmail.send scope (in SCOPES) and the Gmail API enabled in the OAuth project."""
+    import base64
+    from googleapiclient.discovery import build
+    creds = get_credentials()
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    service.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+def send_report_email(run_date, cfg=None, attach_csv=True):
+    """Email the TEMPLATE/WARN/FAIL rows for run_date. Returns True if sent.
+    Delivery method comes from the config: 'gmail_api' (Google OAuth, no password) or 'smtp'."""
+    cfg = cfg or load_email_config()
+    if not cfg:
+        print("  (email skipped: not configured — create email_config.json; "
+              "see email_config.example.json)")
+        return False
+    msg, recipients, n = _build_report_message(run_date, cfg, attach_csv)
+    try:
+        if cfg["method"] == "gmail_api":
+            _send_via_gmail_api(msg)
+        else:
+            _send_via_smtp(msg, recipients, cfg)
+    except Exception as e:
+        print(f"  WARNING: could not send report email via {cfg['method']}: "
+              f"{type(e).__name__}: {str(e).splitlines()[0][:180]}")
+        return False
+    print(f"  Report email sent via {cfg['method']} to {', '.join(recipients)} ({n} row(s)).")
+    return True
+
 # ── Main ─────────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="only check N offers (after offset)")
     ap.add_argument("--offset", type=int, default=0, help="skip the first N offers (chunking)")
     ap.add_argument("--brand", default="", help="only this brand (Santander/Frontier/TDBANK)")
+    ap.add_argument("--sku", default="",
+                    help="only these offers (comma-separated sku/Offer ID) — targeted re-QC. "
+                         "Overwrites just their screenshots and updates only their rows in "
+                         "today's CSV/Sheet (the rest of the day's report is left untouched).")
+    ap.add_argument("--direct-only", action="store_true",
+                    help="QC only offers with a direct redemption_url; skip BI/BIFROST (no token needed)")
+    ap.add_argument("--bifrost-optional", action="store_true",
+                    help="if the Bifrost token is missing/expired, skip BI/BIFROST and QC the rest "
+                         "instead of stopping (for unattended daily runs)")
+    ap.add_argument("--no-bifrost-api", action="store_true",
+                    help="don't call the Bifrost API; QC BI/BIFROST offers using the redemption_url "
+                         "already in the sheet (filled in manually). BI/BIFROST rows still blank are "
+                         "skipped. No token needed.")
     ap.add_argument("--resume", action="store_true",
                     help="keep today's CSV and skip offers already recorded in it")
+    ap.add_argument("--email", action="store_true",
+                    help="after the run, email the TEMPLATE/WARN/FAIL rows (brand, merchant, "
+                         "redemption_url, result) to the address in email_config.json / QC_EMAIL_TO")
+    ap.add_argument("--email-only", action="store_true",
+                    help="just email today's existing CSV report; don't re-check any URLs")
     ap.add_argument("--no-sheet", action="store_true", help="don't write the results tab to the Sheet")
     ap.add_argument("--sheet-only", action="store_true",
                     help="just push today's existing CSV to the Sheet tab; don't re-check any URLs")
     ap.add_argument("--no-proxy", action="store_true",
                     help="ignore any configured proxy (QC_PROXY / proxy.txt / PROXY) for this run")
     args = ap.parse_args()
+
+    # --email-only: just email today's existing CSV report (no Google auth, no re-check).
+    if args.email_only:
+        run_date = datetime.now().strftime("%Y-%m-%d")
+        send_report_email(run_date)
+        return
 
     if not os.path.exists(CREDS_PATH):
         sys.exit(f"ERROR: {CREDS_PATH} not found.")
@@ -862,9 +1223,20 @@ def main():
         return
 
     offers, wl_ws = load_worklist(ss)
+    if args.direct_only:
+        offers = [o for o in offers if o["source"].strip().upper() not in BIFROST_SOURCES]
+        print(f"--direct-only: skipping BI/BIFROST, {len(offers)} direct-url offers remain")
     if args.brand:
         offers = [o for o in offers if o["brand"].lower() == args.brand.lower()]
         print(f"Filtered to brand '{args.brand}': {len(offers)} offers")
+    if args.sku:
+        wanted = {s.strip() for s in args.sku.split(",") if s.strip()}
+        offers = [o for o in offers if o["sku"] in wanted]
+        found = {o["sku"] for o in offers}
+        print(f"Targeted re-QC of sku(s) {sorted(wanted)}: {len(offers)} offer(s) matched")
+        missing = wanted - found
+        if missing:
+            print(f"  (not found in the worklist: {sorted(missing)})")
     if args.offset:
         offers = offers[args.offset:]
         print(f"Skipped first {args.offset} offers")
@@ -872,9 +1244,17 @@ def main():
         offers = offers[:args.limit]
         print(f"Limited to {len(offers)} offers")
 
-    # BI/BIFROST offers: resolve redemption_url from the Bifrost API (offerId = external_offer_id)
-    # and write it back into the worklist's redemption_url column (skipped under --no-sheet).
-    resolve_bifrost_offers(offers, None if args.no_sheet else wl_ws)
+    # QC only the links already present in the sheet's redemption_url column. The Bifrost
+    # API and the requests redirect-resolution are intentionally NOT used — URL preparation
+    # (Bifrost resolution, redirect following) is handled in a separate project that writes
+    # the final URL into the sheet. Any row still blank is skipped. (--no-bifrost-api /
+    # --bifrost-optional are accepted for compatibility but are now no-ops.)
+    blank = [o for o in offers if not o.get("url", "").strip()]
+    if blank:
+        offers[:] = [o for o in offers if o.get("url", "").strip()]
+        print(f"Skipped {len(blank)} row(s) with no redemption_url.")
+    print(f"QC'ing {len(offers)} offer(s) straight from the sheet's redemption_url "
+          f"(Bifrost API and redirect resolution disabled).")
 
     # Resume: skip offers already in today's CSV; else start the CSV fresh.
     done = load_done(csv_path) if args.resume else set()
@@ -885,6 +1265,16 @@ def main():
         print(f"Resume: {before - len(offers)} already done, {len(offers)} remaining")
     if not offers:
         print("Nothing left to check.")
+    elif args.sku:
+        # Targeted re-QC: collect results in memory, then update ONLY these offers' rows in
+        # today's CSV (keep everything else). Screenshots overwrite at their existing paths.
+        print(f"\nRe-checking {len(offers)} targeted URL(s) (concurrency={CONCURRENCY})...\n")
+        collected = []
+        t0 = time.time()
+        asyncio.run(run_qc(offers, run_date, collected.append, proxy=pw_proxy))
+        upsert_csv(csv_path, collected, checked_at)
+        print(f"\n(re-QC took {(time.time()-t0)/60:.1f} min; updated {len(collected)} row(s) "
+              f"in {os.path.basename(csv_path)}, rest of the report kept)")
     else:
         print(f"\nChecking {len(offers)} URLs (concurrency={CONCURRENCY})...\n")
         f = open(csv_path, "a" if not new_file else "w", newline="", encoding="utf-8")
@@ -921,6 +1311,10 @@ def main():
             print(f"Sheet tab  : '{tab}' updated")
         except Exception as e:
             print(f"WARNING: could not write results tab: {e}")
+
+    # Email the problem rows (TEMPLATE/WARN/FAIL) to the team once the run is complete.
+    if args.email:
+        send_report_email(run_date)
     print("="*60)
 
 if __name__ == "__main__":
