@@ -10,7 +10,7 @@
 #   for /f %%R in ('powershell -NoProfile -ExecutionPolicy Bypass -File scheduler\throttle_check.ps1 -MinHours 6') do set QC_DECIDE=%%R
 
 param(
-    [double]$MinHours = 6
+    [double]$MinHours = 12
 )
 
 $ErrorActionPreference = 'Stop'
