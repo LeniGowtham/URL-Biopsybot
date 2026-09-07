@@ -18,7 +18,7 @@ Usage:
   python url_qc.py --brand Frontier
   python url_qc.py --no-sheet      # local screenshots + CSV only
 """
-import os, sys, csv, time, argparse, asyncio, re, random, uuid, shutil
+import os, sys, csv, json, time, argparse, asyncio, re, random, uuid, shutil
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -120,8 +120,13 @@ def _resolve_screenshot_root():
 SCREENSHOT_ROOT= _resolve_screenshot_root()
 REPORT_DIR     = os.path.join(SCRIPT_DIR, "reports")
 CHROME_PROFILE = os.path.join(SCRIPT_DIR, ".chrome_profile")  # persistent real-Chrome profile (final tier)
+# Persistent "URL memory": the last non-blank redemption_url seen for each offer, so a row
+# that is blank in the sheet today (e.g. a BI/BIFROST offer whose URL is prepared elsewhere
+# and not yet re-filled) can still be QC'd against the URL it carried on a previous run,
+# instead of being skipped. Keyed by brand||offer-id. Local/generated (gitignored).
+URL_CACHE_FILE = os.path.join(SCRIPT_DIR, "url_cache.json")
 
-CONCURRENCY       = 4        # parallel pages for normal merchant/affiliate links
+CONCURRENCY       = int(os.environ.get("QC_CONCURRENCY", "4") or "4")  # parallel pages for normal merchant/affiliate links (env-overridable to throttle memory)
 REDEEM_CONCURRENCY= 2        # parallel pages for the Capillary redeem/redirect endpoint
 REDEEM_MIN_GAP    = 1.2      # min seconds between two redeem calls (rate-limit guard)
 NAV_TIMEOUT_MS = 30000       # per-page navigation timeout
@@ -396,6 +401,60 @@ def load_worklist(spreadsheet):
     print(f"Worklist tab: '{ws.title}'  ->  {len(offers)} rows "
           f"({n_url} with a redemption_url, {len(offers)-n_url} blank)")
     return offers, ws
+
+# ── Persistent URL memory ────────────────────────────────────────────────────────
+# Remembers the last non-blank redemption_url each offer had, so a row that is blank in
+# the sheet today can fall back to the URL it was last QC'd with (rather than being
+# skipped). The Bifrost API is NOT used — URLs are prepared elsewhere and filled into the
+# sheet; this just preserves the previous value when today's cell happens to be empty.
+def cache_key(o):
+    """Stable per-offer key: brand||offer-id (sku, else external_offer_id). None if unkeyable."""
+    ident = (o.get("sku") or "").strip() or (o.get("external_offer_id") or "").strip()
+    if not ident:
+        return None
+    return f"{(o.get('brand') or '').strip().lower()}||{ident}"
+
+def load_url_cache():
+    try:
+        with open(URL_CACHE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"  (url cache unreadable, starting fresh: {e})")
+        return {}
+
+def save_url_cache(cache):
+    try:
+        with open(URL_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, ensure_ascii=False, sort_keys=True)
+    except Exception as e:
+        print(f"  (url cache save skipped: {e})")
+
+def remember_urls(offers, run_date):
+    """Update the URL memory with every offer that HAS a redemption_url today. Returns the
+    (possibly grown) cache dict so the caller can use it for the blank-row fallback."""
+    cache = load_url_cache()
+    updated = 0
+    for o in offers:
+        u = (o.get("url") or "").strip()
+        k = cache_key(o)
+        if u and k:
+            prev = cache.get(k)
+            cache[k] = {"url": u, "last_seen": run_date}
+            updated += 1
+    save_url_cache(cache)
+    return cache
+
+def cached_url_for(cache, o):
+    """Last-known redemption_url for this offer, or ("", "") if none remembered."""
+    entry = cache.get(cache_key(o) or "")
+    if isinstance(entry, dict):
+        return (entry.get("url", "") or "").strip(), entry.get("last_seen", "")
+    if isinstance(entry, str):           # tolerate an older plain-string cache format
+        return entry.strip(), ""
+    return "", ""
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 def safe_name(s: str) -> str:
@@ -1290,6 +1349,9 @@ def main():
         return
 
     offers, wl_ws = load_worklist(ss)
+    # Remember every URL present in the sheet TODAY (across the full worklist, before any
+    # brand/limit filtering) so blank rows can later fall back to their last-known URL.
+    url_cache = remember_urls(offers, run_date)
     if args.direct_only:
         offers = [o for o in offers if o["source"].strip().upper() not in BIFROST_SOURCES]
         print(f"--direct-only: skipping BI/BIFROST, {len(offers)} direct-url offers remain")
@@ -1316,11 +1378,30 @@ def main():
     # (Bifrost resolution, redirect following) is handled in a separate project that writes
     # the final URL into the sheet. Any row still blank is skipped. (--no-bifrost-api /
     # --bifrost-optional are accepted for compatibility but are now no-ops.)
-    blank = [o for o in offers if not o.get("url", "").strip()]
-    if blank:
-        offers[:] = [o for o in offers if o.get("url", "").strip()]
-        print(f"Skipped {len(blank)} row(s) with no redemption_url.")
-    print(f"QC'ing {len(offers)} offer(s) straight from the sheet's redemption_url "
+    # For any row blank in the sheet today, fall back to the last redemption_url we remember
+    # for that offer (url_cache.json). Rows still blank after that (never seen with a URL) are
+    # skipped. This QCs the previous URL rather than dropping the offer entirely.
+    from_cache = 0
+    still_blank = 0
+    for o in offers:
+        if (o.get("url") or "").strip():
+            continue
+        cu, when = cached_url_for(url_cache, o)
+        if cu:
+            o["url"] = cu
+            o["url_from_cache"] = True
+            o["url_cached_when"] = when
+            from_cache += 1
+        else:
+            still_blank += 1
+    if from_cache:
+        print(f"Reused last-known redemption_url for {from_cache} blank row(s) "
+              f"from {os.path.basename(URL_CACHE_FILE)}.")
+    if still_blank:
+        offers[:] = [o for o in offers if (o.get("url") or "").strip()]
+        print(f"Skipped {still_blank} row(s) with no redemption_url and no remembered URL.")
+    print(f"QC'ing {len(offers)} offer(s) from the sheet's redemption_url"
+          f"{' (+ remembered URLs for blank rows)' if from_cache else ''} "
           f"(Bifrost API and redirect resolution disabled).")
 
     # Resume: skip offers already in today's CSV; else start the CSV fresh.

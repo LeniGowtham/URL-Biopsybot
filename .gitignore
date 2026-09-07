@@ -11,6 +11,7 @@ email_config.json
 # ── Generated output ──────────────────────────────────────────────────
 screenshots/
 reports/
+url_cache.json
 logs/
 *.log
 logs_*.txt
