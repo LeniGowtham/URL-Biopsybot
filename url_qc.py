@@ -331,7 +331,16 @@ def _creds_from_token_json(raw):
     GOOGLE_OAUTH_TOKEN secret instead of the local token.pkl. Refreshes silently if expired —
     it never opens a browser. Mint it locally with `python scheduler/export_token.py`."""
     from google.oauth2.credentials import Credentials
-    creds = Credentials.from_authorized_user_info(json.loads(raw), SCOPES)
+    info = json.loads(raw)
+    # A common mistake is pasting oauth_credentials.json (the client-secrets file, shaped
+    # {"installed":{...}} / {"web":{...}}) into the secret. That's the wrong file — the secret
+    # must be the authorized-user token from `python scheduler/export_token.py`.
+    if "installed" in info or "web" in info:
+        raise SystemExit("GOOGLE_OAUTH_TOKEN looks like oauth_credentials.json (client secrets), "
+                         "not an authorized-user token. Regenerate it with "
+                         "`python scheduler/export_token.py` and paste that (see "
+                         "scheduler/GITHUB_ACTIONS.md).")
+    creds = Credentials.from_authorized_user_info(info, SCOPES)
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
     return creds
