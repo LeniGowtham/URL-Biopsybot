@@ -1350,8 +1350,11 @@ def main():
         send_report_email(run_date)
         return
 
-    if not os.path.exists(CREDS_PATH):
-        sys.exit(f"ERROR: {CREDS_PATH} not found.")
+    # oauth_credentials.json is only needed for the interactive browser login. Unattended/CI
+    # runs authenticate via the GOOGLE_OAUTH_TOKEN secret instead, so don't require the file then.
+    if not os.environ.get("GOOGLE_OAUTH_TOKEN", "").strip() and not os.path.exists(CREDS_PATH):
+        sys.exit(f"ERROR: {CREDS_PATH} not found. For unattended runs set the "
+                 "GOOGLE_OAUTH_TOKEN secret (see scheduler/GITHUB_ACTIONS.md).")
 
     # Resolve the optional outbound proxy for merchant-facing traffic (browser + redirect
     # resolution). HTTP_PROXIES (module global) is read by resolve_redirects; pw_proxy is
