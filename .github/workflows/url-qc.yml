@@ -1,0 +1,75 @@
+name: URL QC (daily)
+
+# Runs the offer-URL QC unattended in GitHub's cloud.
+# Google login comes from the GOOGLE_OAUTH_TOKEN secret (never a browser prompt).
+# Screenshots + reports are saved as downloadable run artifacts (the G: shared drive
+# does not exist on cloud runners).
+
+on:
+  schedule:
+    # 05:30 UTC = 11:00 AM IST, daily. cron is always UTC — adjust as needed.
+    - cron: "30 5 * * *"
+  workflow_dispatch:      # allow manual "Run workflow" from the Actions tab
+    inputs:
+      limit:
+        description: "Only check N offers (0 = all)"
+        required: false
+        default: "0"
+      brand:
+        description: "Only this brand (Santander/Frontier/TDBANK; blank = all)"
+        required: false
+        default: ""
+
+# Don't let two runs overlap (the Sheet + rate limits are shared).
+concurrency:
+  group: url-qc
+  cancel-in-progress: false
+
+jobs:
+  qc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run URL QC
+        env:
+          # Pre-authorized Google login (Sheets + gmail.send). Mint locally with
+          # `python scheduler/export_token.py`. See scheduler/GITHUB_ACTIONS.md.
+          GOOGLE_OAUTH_TOKEN: ${{ secrets.GOOGLE_OAUTH_TOKEN }}
+          # Write screenshots into the workspace so they can be uploaded as artifacts.
+          QC_SCREENSHOT_ROOT: ${{ github.workspace }}/screenshots
+          # Email the report via the Gmail API using the same login (no SMTP password needed).
+          QC_EMAIL_METHOD: gmail_api
+          QC_EMAIL_TO: ${{ vars.QC_EMAIL_TO }}
+          QC_EMAIL_CC: ${{ vars.QC_EMAIL_CC }}
+          # Optional outbound proxy (leave the secret unset to run without one).
+          QC_PROXY: ${{ secrets.QC_PROXY }}
+        run: |
+          python url_qc.py --email \
+            --limit "${{ github.event.inputs.limit || '0' }}" \
+            ${{ github.event.inputs.brand && format('--brand {0}', github.event.inputs.brand) || '' }}
+
+      - name: Upload screenshots + reports
+        if: always()          # keep artifacts even if the QC step failed partway
+        uses: actions/upload-artifact@v4
+        with:
+          name: url-qc-${{ github.run_id }}
+          path: |
+            screenshots/
+            reports/
+          if-no-files-found: ignore
+          retention-days: 14

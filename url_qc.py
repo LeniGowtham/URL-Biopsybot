@@ -325,7 +325,31 @@ def get_proxy():
     return pw, {"http": url, "https": url}, masked
 
 # ── Auth (matches the pattern used by the other automations in this account) ─────
+def _creds_from_token_json(raw):
+    """Build Credentials from an 'authorized user' JSON string (access token + refresh_token
+    + client_id/secret). Used for unattended/CI runs where the token is supplied via the
+    GOOGLE_OAUTH_TOKEN secret instead of the local token.pkl. Refreshes silently if expired —
+    it never opens a browser. Mint it locally with `python scheduler/export_token.py`."""
+    from google.oauth2.credentials import Credentials
+    creds = Credentials.from_authorized_user_info(json.loads(raw), SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    return creds
+
 def get_credentials():
+    # 1) Unattended/CI: a pre-authorized token supplied via env/secret. This path only ever
+    #    refreshes the embedded refresh_token — it never opens a browser — so it works headless.
+    #    The token must have been minted with all SCOPES (see scheduler/GITHUB_ACTIONS.md).
+    token_env = os.environ.get("GOOGLE_OAUTH_TOKEN", "").strip()
+    if token_env:
+        creds = _creds_from_token_json(token_env)
+        have  = set(getattr(creds, "scopes", None) or [])
+        if not set(SCOPES).issubset(have):
+            raise SystemExit("GOOGLE_OAUTH_TOKEN is missing required scopes "
+                             f"{SCOPES}; re-mint it locally (see scheduler/GITHUB_ACTIONS.md).")
+        return creds
+
+    # 2) Local/interactive: the usual token.pkl + oauth_credentials.json flow.
     creds = None
     if os.path.exists(TOKEN_PATH):
         with open(TOKEN_PATH, "rb") as f:
@@ -338,6 +362,12 @@ def get_credentials():
         if creds and creds.expired and creds.refresh_token and has_scopes:
             creds.refresh(Request())
         else:
+            if not os.path.exists(CREDS_PATH):
+                raise SystemExit(
+                    f"No usable Google login: {TOKEN_PATH} is missing/invalid and "
+                    f"{CREDS_PATH} isn't present for an interactive login. For unattended "
+                    "runs, set the GOOGLE_OAUTH_TOKEN secret instead "
+                    "(see scheduler/GITHUB_ACTIONS.md).")
             flow  = InstalledAppFlow.from_client_secrets_file(CREDS_PATH, SCOPES)
             creds = flow.run_local_server(port=0)
         with open(TOKEN_PATH, "wb") as f:

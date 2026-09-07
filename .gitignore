@@ -1,6 +1,7 @@
 # ── Secrets / credentials (never commit) ──────────────────────────────
 oauth_credentials.json
 token.pkl
+token.json
 bifrost_token.txt
 proxy.txt
 email_config.json
