@@ -7,8 +7,8 @@ name: URL QC (daily)
 
 on:
   schedule:
-    # 05:30 UTC = 11:00 AM IST, daily. cron is always UTC — adjust as needed.
-    - cron: "30 5 * * *"
+    # 01:30 UTC = 07:00 AM IST, daily. cron is always UTC — adjust as needed.
+    - cron: "30 1 * * *"
   workflow_dispatch:      # allow manual "Run workflow" from the Actions tab
     inputs:
       limit:
