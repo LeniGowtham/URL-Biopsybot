@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy this to email_config.json (gitignored). Two delivery methods:",
+
+  "_option_A_gmail_api": "RECOMMENDED when App Passwords are disabled. Sends via the Gmail API using the SAME Google login already used for Sheets (no password). Requires: (1) gmail.send scope (already in SCOPES) so you re-approve consent once, (2) the Gmail API enabled in your OAuth project. Config is just method/to/sender:",
+  "method": "gmail_api",
+  "to": "kampalapur.gowtham@capillarytech.com",
+  "sender": "kampalapur.gowtham@capillarytech.com",
+
+  "_option_B_smtp": "Classic SMTP with a Gmail App Password (needs 2-Step Verification + App Passwords enabled by your admin). Use these keys INSTEAD of method=gmail_api:",
+  "_smtp_example": {
+    "method": "smtp",
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "user": "you@capillarytech.com",
+    "password": "your-16-char-app-password",
+    "sender": "you@capillarytech.com",
+    "to": "kampalapur.gowtham@capillarytech.com",
+    "use_tls": true
+  }
+}

@@ -3,6 +3,7 @@ oauth_credentials.json
 token.pkl
 bifrost_token.txt
 proxy.txt
+email_config.json
 
 # ── Local browser profile (cookies / session) ─────────────────────────
 .chrome_profile/
