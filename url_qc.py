@@ -1143,7 +1143,7 @@ def write_sheet_tab(spreadsheet, run_date):
 #   email_config.json: {"host":"smtp.gmail.com","port":587,"user":"you@capillarytech.com",
 #                        "password":"<app-password>","sender":"you@capillarytech.com",
 #                        "to":"kampalapur.gowtham@capillarytech.com","use_tls":true}
-EMAIL_TO_DEFAULT  = "kampalapur.gowtham@capillarytech.com"
+EMAIL_TO_DEFAULT  = "kampalapur.gowtham@capillarytech.com, contentops@capillarytech.com"
 EMAIL_CONFIG_FILE = os.path.join(SCRIPT_DIR, "email_config.json")
 EMAIL_RESULTS     = ("FAIL", "TEMPLATE", "WARN")   # problems only
 # Link to the live results tab (RESULTS_TAB "URL QC", gid 1254505539), shown in the email.
